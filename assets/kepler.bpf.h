@@ -233,9 +233,9 @@ struct sched_switch_args {
 };
 
 struct trace_event_raw_softirq {
-    unsigned long softirq;
-    unsigned long vec;
-    unsigned long long ip;
+    unsigned long long pad;
+    unsigned int vec;
 };
+
 
   //////////////////////////////

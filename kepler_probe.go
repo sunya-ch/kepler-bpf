@@ -10,7 +10,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"time"
 	"unsafe"
@@ -65,6 +64,8 @@ type ProcessBPFMetrics struct {
 var (
 	perfEvents = map[string][]int{}
 	byteOrder  binary.ByteOrder
+	uint32Key  uint32
+	uint64Key  uint64
 )
 
 func init() {
@@ -76,6 +77,7 @@ const (
 	tableCPUFreqName = "cpu_freq_array"
 	mapSize          = 10240
 	cpuNumSize       = 128
+	maxRetry         = 5
 )
 
 func determineHostByteOrder() binary.ByteOrder {
@@ -156,34 +158,47 @@ func collect(bpfModule *bpf.Module) {
 	cpuFreq, err := bpfModule.GetMap("cpu_freq_array")
 	must(err)
 
-	iterator := processes.Iterator(mapSize)
+	processKeySize := int(unsafe.Sizeof(uint64Key))
+	iterator := processes.Iterator(processKeySize)
 	var ct ProcessBPFMetrics
 	var byteOrder binary.ByteOrder = determineHostByteOrder()
 	valueSize := int(unsafe.Sizeof(ProcessBPFMetrics{}))
 	keys := []uint32{}
-	for iterator.Next() {
+	retry := 0
+	next := iterator.Next()
+	for next {
 		keyBytes := iterator.Key()
 		key := byteOrder.Uint32(keyBytes)
-		data, err := processes.GetValue(key, valueSize)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to get data: %v\n", err)
-			continue // this only happens if there is a problem in the bpf code
+		data, getErr := processes.GetValue(key, valueSize)
+		if getErr != nil {
+			retry += 1
+			if retry > maxRetry {
+				klog.Infof("failed to get data: %v, retry: %d \n", getErr, maxRetry)
+				next = iterator.Next()
+				retry = 0
+			}
+			continue
 		}
-		err = binary.Read(bytes.NewBuffer(data), byteOrder, &ct)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to decode received data: %v\n", err)
-			continue // this only happens if there is a problem in the bpf code
+		getErr = binary.Read(bytes.NewBuffer(data), byteOrder, &ct)
+		if getErr != nil {
+			klog.Infof("failed to decode received data: %v, retry\n", getErr)
+			next = iterator.Next()
+			retry = 0
+			continue
 		}
-		fmt.Printf("%d: %s, %d, %d, %d\n", ct.PID, ct.Command, ct.ProcessRunTime, ct.CPUCycles, ct.CacheMisses)
+		fmt.Printf("%d: %s, %d, %d, %d, %d (retry=%d)\n", ct.PID, ct.Command, ct.ProcessRunTime, ct.CPUCycles, ct.CacheMisses, ct.VecNR[IRQNetRX], retry)
 		keys = append(keys, key)
+		next = iterator.Next()
+		retry = 0
 	}
 	for _, key := range keys {
 		processes.DeleteKey(key)
 	}
 
-	iterator = cpuFreq.Iterator(cpuNumSize)
+	cpuFreqkeySize := int(unsafe.Sizeof(uint32Key))
+	iterator = cpuFreq.Iterator(cpuFreqkeySize)
 	var freq uint32
-	valueSize = int(unsafe.Sizeof(freq))
+	valueSize = int(unsafe.Sizeof(uint32Key))
 	for iterator.Next() {
 		keyBytes := iterator.Key()
 		cpu := byteOrder.Uint32(keyBytes)
@@ -202,10 +217,7 @@ func collect(bpfModule *bpf.Module) {
 }
 
 func main() {
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
-
-	bpfModule, err := bpf.NewModuleFromFile("kepler.bpf.o")
+	bpfModule, err := bpf.NewModuleFromFile("./assets/x86_64_kepler.bpf.o")
 	must(err)
 	defer bpfModule.Close()
 
